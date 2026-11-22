@@ -2,24 +2,90 @@ package proxy
 
 import (
 	"context"
+	"crypto/cipher"
 	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
 var cfFallbackIPs = []string{
-	"104.21.82.196",
 	"172.67.162.213",
-	"104.16.132.229",
-	"172.64.155.209",
+	"104.21.82.196",
+}
+
+var (
+	badRelayMu  sync.Mutex
+	badRelayIPs = make(map[string]time.Time)
+	zeroRxCount = make(map[string]int)
+)
+
+func clearBadRelayIPs() {
+	badRelayMu.Lock()
+	badRelayIPs = make(map[string]time.Time)
+	zeroRxCount = make(map[string]int)
+	badRelayMu.Unlock()
+}
+
+func markBadRelayIP(ip string, ttl time.Duration) {
+	if ip == "" {
+		return
+	}
+	badRelayMu.Lock()
+	badRelayIPs[ip] = time.Now().Add(ttl)
+	delete(zeroRxCount, ip)
+	badRelayMu.Unlock()
+}
+
+func isBadRelayIP(ip string) bool {
+	badRelayMu.Lock()
+	defer badRelayMu.Unlock()
+	until, ok := badRelayIPs[ip]
+	if !ok {
+		return false
+	}
+	if time.Now().After(until) {
+		delete(badRelayIPs, ip)
+		return false
+	}
+	return true
+}
+
+func (s *Server) recordRelayRx(ip string, rxBytes int64) bool {
+	if ip == "" {
+		return false
+	}
+	rotated := false
+	badRelayMu.Lock()
+	if rxBytes > 0 {
+		delete(zeroRxCount, ip)
+	} else {
+		zeroRxCount[ip]++
+		if zeroRxCount[ip] >= 2 {
+			delete(zeroRxCount, ip)
+			badRelayIPs[ip] = time.Now().Add(5 * time.Hour)
+			rotated = true
+		}
+	}
+	badRelayMu.Unlock()
+
+	if rotated {
+		s.workingIPMu.Lock()
+		if s.workingRelayIP == ip {
+			s.workingRelayIP = ""
+		}
+		s.workingIPMu.Unlock()
+	}
+	return rotated
 }
 
 var dcIPPools = map[int][]string{
@@ -74,21 +140,36 @@ func (s *Server) dialDirectWebSocket(dc int, isMedia bool, fastMode bool) (*webs
 	return nil, "", "", lastErr
 }
 
-func (s *Server) pumpDirectWebSocket(clientConn net.Conn, wsConn *websocket.Conn, initPacket []byte, info mtprotoInit, host, usedIP string, id int64) {
+// --- MTProto Proxy (с перешифрованием на лету) ---
+
+func (s *Server) pumpMTProtoDirectWS(
+	clientConn net.Conn,
+	wsConn *websocket.Conn,
+	sess *mtprotoSession,
+	outInit []byte,
+	upEnc, upDec cipher.Stream,
+	host, usedIP string,
+	id int64,
+) {
 	defer wsConn.Close()
 
 	s.setStatus(fmt.Sprintf("Напрямую (%s)", usedIP))
-	if info.isMedia {
-		s.addLog("DIRECT", fmt.Sprintf("#%d Медиа -> %s (%s)", id, host, usedIP))
+	if sess.isMedia {
+		s.addLog("DIRECT", fmt.Sprintf("#%d MTProto Медиа DC%d -> %s (%s)", id, sess.dc, host, usedIP))
 	} else {
-		s.addLog("DIRECT", fmt.Sprintf("#%d Туннель -> %s (%s)", id, host, usedIP))
+		s.addLog("DIRECT", fmt.Sprintf("#%d MTProto DC%d -> %s (%s)", id, sess.dc, host, usedIP))
 	}
 
-	splitter := newMTProtoSplitter(info.protoID, info.stream)
-	s.runWebSocketBridge(clientConn, wsConn, initPacket, splitter)
+	_, _ = s.runMTProtoWSBridge(clientConn, wsConn, sess, outInit, upEnc, upDec, true)
 }
 
-func (s *Server) bridgeWorkerTCP(clientConn net.Conn, initialData []byte, dstHost string, dstPort int, id int64) {
+func (s *Server) bridgeMTProtoWorker(
+	clientConn net.Conn,
+	sess *mtprotoSession,
+	outInit []byte,
+	upEnc, upDec cipher.Stream,
+	id int64,
+) {
 	s.mu.RLock()
 	relay := s.relayHost
 	relayKey := s.relayKey
@@ -98,11 +179,62 @@ func (s *Server) bridgeWorkerTCP(clientConn net.Conn, initialData []byte, dstHos
 		return
 	}
 
-	cleanRelay := trimRelayHost(relay)
+	mediaFlag := "0"
+	if sess.isMedia {
+		mediaFlag = "1"
+	}
+
+	wsURL := fmt.Sprintf("wss://%s/apiws?dc=%d&media=%s", trimRelayHost(relay), sess.dc, mediaFlag)
+	if relayKey != "" {
+		wsURL += "&key=" + url.QueryEscape(relayKey)
+	}
+
+	wsConn, usedIP, relayMode, ok := s.dialWorkerConn(wsURL, []string{"binary"}, fmt.Sprintf("DC%d", sess.dc), id)
+	if !ok {
+		return
+	}
+	defer wsConn.Close()
+
+	isTCPFallback := relayMode == "tcp"
+	tag := "CF-WS"
+	if isTCPFallback {
+		tag = "CF-TCP"
+		s.setStatus(fmt.Sprintf("Cloudflare TCP (%s)", usedIP))
+	} else {
+		s.setStatus(fmt.Sprintf("Cloudflare WS (%s)", usedIP))
+	}
+
+	if sess.isMedia {
+		s.addLog(tag, fmt.Sprintf("#%d MTProto Медиа DC%d (через %s)", id, sess.dc, usedIP))
+	} else {
+		s.addLog(tag, fmt.Sprintf("#%d MTProto DC%d (через %s)", id, sess.dc, usedIP))
+	}
+
+	rx, closeErr := s.runMTProtoWSBridge(clientConn, wsConn, sess, outInit, upEnc, upDec, !isTCPFallback)
+	s.handleRelayClose(id, usedIP, rx, closeErr)
+}
+
+func (s *Server) bridgeMTProtoWorkerTCP(
+	clientConn net.Conn,
+	sess *mtprotoSession,
+	outInit []byte,
+	upEnc, upDec cipher.Stream,
+	dstHost string,
+	dstPort int,
+	id int64,
+) {
+	s.mu.RLock()
+	relay := s.relayHost
+	relayKey := s.relayKey
+	s.mu.RUnlock()
+
+	if relay == "" {
+		return
+	}
 
 	wsURL := fmt.Sprintf(
 		"wss://%s/apiws?dst=%s&port=%d",
-		cleanRelay,
+		trimRelayHost(relay),
 		url.QueryEscape(dstHost),
 		dstPort,
 	)
@@ -110,53 +242,29 @@ func (s *Server) bridgeWorkerTCP(clientConn net.Conn, initialData []byte, dstHos
 		wsURL += "&key=" + url.QueryEscape(relayKey)
 	}
 
-	var usedIP string
-	dialer := websocket.Dialer{
-		HandshakeTimeout:  7 * time.Second,
-		ReadBufferSize:    64 * 1024,
-		WriteBufferSize:   64 * 1024,
-		EnableCompression: false,
-		NetDialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			conn, ip, err := s.dialRelayTLS(ctx, addr)
-			usedIP = ip
-			return conn, err
-		},
-	}
-
-	wsConn, resp, err := dialer.Dial(wsURL, nil)
-	if resp != nil && resp.Body != nil {
-		_ = resp.Body.Close()
-	}
-	if err != nil {
-		s.setStatus("Ошибка Cloudflare")
-		s.addLog("ERR", fmt.Sprintf("#%d CF -> %s:%d: %v", id, dstHost, dstPort, err))
+	wsConn, usedIP, _, ok := s.dialWorkerConn(wsURL, nil, fmt.Sprintf("%s:%d", dstHost, dstPort), id)
+	if !ok {
 		return
 	}
 	defer wsConn.Close()
 
-	s.setStatus(fmt.Sprintf("Cloudflare (%s)", usedIP))
-	s.addLog("CF", fmt.Sprintf("#%d TCP -> %s:%d (через %s)", id, dstHost, dstPort, usedIP))
+	s.setStatus(fmt.Sprintf("Cloudflare CDN (%s)", usedIP))
+	s.addLog("CF-TCP", fmt.Sprintf("#%d MTProto CDN DC%d -> %s:%d (через %s)", id, sess.dc, dstHost, dstPort, usedIP))
 
-	s.runWebSocketBridge(clientConn, wsConn, initialData, nil)
+	rx, closeErr := s.runMTProtoWSBridge(clientConn, wsConn, sess, outInit, upEnc, upDec, false)
+	s.handleRelayClose(id, usedIP, rx, closeErr)
 }
 
-func trimRelayHost(relay string) string {
-	for _, prefix := range []string{"https://", "http://"} {
-		if len(relay) >= len(prefix) && relay[:len(prefix)] == prefix {
-			relay = relay[len(prefix):]
-		}
-	}
-	for i := 0; i < len(relay); i++ {
-		if relay[i] == '/' || relay[i] == '?' {
-			return relay[:i]
-		}
-	}
-	return relay
-}
-
-func (s *Server) runWebSocketBridge(clientConn net.Conn, wsConn *websocket.Conn, initialData []byte, splitter *mtprotoSplitter) {
-	const pongWait = 45 * time.Second
-	const pingPeriod = 15 * time.Second
+func (s *Server) runMTProtoWSBridge(
+	clientConn net.Conn,
+	wsConn *websocket.Conn,
+	sess *mtprotoSession,
+	outInit []byte,
+	upEnc, upDec cipher.Stream,
+	useSplitter bool,
+) (int64, error) {
+	const pongWait = 65 * time.Second
+	const pingPeriod = 30 * time.Second
 
 	s.trackConn(wsConn)
 	defer s.untrackConn(wsConn)
@@ -167,20 +275,36 @@ func (s *Server) runWebSocketBridge(clientConn net.Conn, wsConn *websocket.Conn,
 		return nil
 	})
 
-	if len(initialData) > 0 {
+	if len(outInit) > 0 {
 		_ = wsConn.SetWriteDeadline(time.Now().Add(8 * time.Second))
-		if err := wsConn.WriteMessage(websocket.BinaryMessage, initialData); err != nil {
-			return
+		if err := wsConn.WriteMessage(websocket.BinaryMessage, outInit); err != nil {
+			return 0, err
 		}
 		_ = wsConn.SetWriteDeadline(time.Time{})
 	}
 
 	var writeMu sync.Mutex
 	var closeOnce sync.Once
-	done := make(chan struct{})
+	var closing atomic.Bool
+	var rxBytes atomic.Int64
 
+	var wsErrMu sync.Mutex
+	var wsErr error
+	setWSErr := func(err error) {
+		if err == nil {
+			return
+		}
+		wsErrMu.Lock()
+		if wsErr == nil {
+			wsErr = err
+		}
+		wsErrMu.Unlock()
+	}
+
+	done := make(chan struct{})
 	shutdown := func() {
 		closeOnce.Do(func() {
+			closing.Store(true)
 			close(done)
 			_ = wsConn.Close()
 			_ = clientConn.Close()
@@ -201,6 +325,9 @@ func (s *Server) runWebSocketBridge(clientConn net.Conn, wsConn *websocket.Conn,
 				_ = wsConn.SetWriteDeadline(time.Time{})
 				writeMu.Unlock()
 				if err != nil {
+					if !closing.Load() {
+						setWSErr(err)
+					}
 					shutdown()
 					return
 				}
@@ -208,24 +335,385 @@ func (s *Server) runWebSocketBridge(clientConn net.Conn, wsConn *websocket.Conn,
 		}
 	}()
 
+	readDone := make(chan struct{})
 	go func() {
+		defer close(readDone)
 		defer shutdown()
 		for {
 			msgType, data, err := wsConn.ReadMessage()
 			if err != nil {
+				if !closing.Load() {
+					setWSErr(err)
+				}
 				return
 			}
 			_ = wsConn.SetReadDeadline(time.Now().Add(pongWait))
-			if msgType != websocket.BinaryMessage {
+			if msgType != websocket.BinaryMessage || len(data) == 0 {
 				continue
 			}
+			rxBytes.Add(int64(len(data)))
+			upDec.XORKeyStream(data, data)
+			sess.clientEnc.XORKeyStream(data, data)
 			if _, err := clientConn.Write(data); err != nil {
 				return
 			}
 		}
 	}()
 
-	buf := make([]byte, 32*1024)
+	var splitter *plainMTProtoSplitter
+	if useSplitter {
+		splitter = newPlainMTProtoSplitter(sess.protoID)
+	}
+
+	buf := make([]byte, 64*1024)
+	for {
+		n, err := clientConn.Read(buf)
+		if n > 0 {
+			plain := make([]byte, n)
+			sess.clientDec.XORKeyStream(plain, buf[:n])
+
+			var frames [][]byte
+			if splitter != nil {
+				frames = splitter.Push(plain)
+			} else {
+				frames = [][]byte{plain}
+			}
+
+			for _, frame := range frames {
+				upEnc.XORKeyStream(frame, frame)
+				writeMu.Lock()
+				_ = wsConn.SetWriteDeadline(time.Now().Add(8 * time.Second))
+				wErr := wsConn.WriteMessage(websocket.BinaryMessage, frame)
+				_ = wsConn.SetWriteDeadline(time.Time{})
+				writeMu.Unlock()
+				if wErr != nil {
+					if !closing.Load() {
+						setWSErr(wErr)
+					}
+					shutdown()
+					<-readDone
+					wsErrMu.Lock()
+					outErr := wsErr
+					wsErrMu.Unlock()
+					return rxBytes.Load(), outErr
+				}
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+
+	shutdown()
+	<-readDone
+	wsErrMu.Lock()
+	outErr := wsErr
+	wsErrMu.Unlock()
+	return rxBytes.Load(), outErr
+}
+
+// --- Legacy SOCKS5 ---
+
+func (s *Server) pumpDirectWebSocket(clientConn net.Conn, wsConn *websocket.Conn, initPacket []byte, info mtprotoInit, host, usedIP string, id int64) {
+	defer wsConn.Close()
+
+	s.setStatus(fmt.Sprintf("Напрямую (%s)", usedIP))
+	if info.isMedia {
+		s.addLog("DIRECT", fmt.Sprintf("#%d Медиа -> %s (%s)", id, host, usedIP))
+	} else {
+		s.addLog("DIRECT", fmt.Sprintf("#%d Туннель -> %s (%s)", id, host, usedIP))
+	}
+
+	splitter := newMTProtoSplitter(info.protoID, info.stream)
+	_, _ = s.runWebSocketBridge(clientConn, wsConn, initPacket, splitter)
+}
+
+func (s *Server) bridgeWorkerDC(clientConn net.Conn, initPacket []byte, info mtprotoInit, id int64) {
+	s.mu.RLock()
+	relay := s.relayHost
+	relayKey := s.relayKey
+	s.mu.RUnlock()
+
+	if relay == "" {
+		return
+	}
+
+	mediaFlag := "0"
+	if info.isMedia {
+		mediaFlag = "1"
+	}
+
+	wsURL := fmt.Sprintf("wss://%s/apiws?dc=%d&media=%s", trimRelayHost(relay), info.dc, mediaFlag)
+	if relayKey != "" {
+		wsURL += "&key=" + url.QueryEscape(relayKey)
+	}
+
+	wsConn, usedIP, relayMode, ok := s.dialWorkerConn(wsURL, []string{"binary"}, fmt.Sprintf("DC%d", info.dc), id)
+	if !ok {
+		return
+	}
+	defer wsConn.Close()
+
+	tag := "CF-WS"
+	var splitter *mtprotoSplitter
+	if relayMode == "tcp" {
+		tag = "CF-TCP"
+		s.setStatus(fmt.Sprintf("Cloudflare TCP (%s)", usedIP))
+	} else {
+		s.setStatus(fmt.Sprintf("Cloudflare WS (%s)", usedIP))
+		splitter = newMTProtoSplitter(info.protoID, info.stream)
+	}
+	s.addLog(tag, fmt.Sprintf("#%d DC%d (media=%s) через %s", id, info.dc, mediaFlag, usedIP))
+
+	rx, closeErr := s.runWebSocketBridge(clientConn, wsConn, initPacket, splitter)
+	s.handleRelayClose(id, usedIP, rx, closeErr)
+}
+
+func (s *Server) bridgeWorkerTCP(clientConn net.Conn, initialData []byte, dstHost string, dstPort int, id int64) {
+	s.mu.RLock()
+	relay := s.relayHost
+	relayKey := s.relayKey
+	s.mu.RUnlock()
+
+	if relay == "" {
+		return
+	}
+
+	wsURL := fmt.Sprintf(
+		"wss://%s/apiws?dst=%s&port=%d",
+		trimRelayHost(relay),
+		url.QueryEscape(dstHost),
+		dstPort,
+	)
+	if relayKey != "" {
+		wsURL += "&key=" + url.QueryEscape(relayKey)
+	}
+
+	wsConn, usedIP, _, ok := s.dialWorkerConn(wsURL, nil, fmt.Sprintf("%s:%d", dstHost, dstPort), id)
+	if !ok {
+		return
+	}
+	defer wsConn.Close()
+
+	s.setStatus(fmt.Sprintf("Cloudflare TCP (%s)", usedIP))
+	s.addLog("CF-TCP", fmt.Sprintf("#%d TCP -> %s:%d (через %s)", id, dstHost, dstPort, usedIP))
+
+	rx, closeErr := s.runWebSocketBridge(clientConn, wsConn, initialData, nil)
+	s.handleRelayClose(id, usedIP, rx, closeErr)
+}
+
+func (s *Server) handleRelayClose(id int64, usedIP string, rx int64, closeErr error) {
+	if rx > 0 {
+		s.recordRelayRx(usedIP, rx)
+		return
+	}
+	if websocket.IsCloseError(closeErr, websocket.CloseNormalClosure) {
+		return
+	}
+	rotated := s.recordRelayRx(usedIP, 0)
+	reason := "нет ответа от сервера (клиент закрыл)"
+	if closeErr != nil {
+		reason = closeErr.Error()
+	}
+	if rotated {
+		s.addLog("WARN", fmt.Sprintf("#%d CF (%s) rx=0: %s — смена узла", id, usedIP, reason))
+	} else {
+		s.addLog("WARN", fmt.Sprintf("#%d CF (%s) rx=0: %s", id, usedIP, reason))
+	}
+}
+
+func (s *Server) dialWorkerConn(wsURL string, subprotocols []string, targetLabel string, id int64) (*websocket.Conn, string, string, bool) {
+	if waitUntil := s.cfBackoffUntil.Load(); waitUntil > 0 {
+		if rem := time.Until(time.Unix(0, waitUntil)); rem > 0 {
+			if rem > 4*time.Second {
+				rem = 4 * time.Second
+			}
+			time.Sleep(rem)
+		}
+	}
+
+	var usedIP string
+	dialer := websocket.Dialer{
+		Subprotocols:      subprotocols,
+		HandshakeTimeout:  7 * time.Second,
+		ReadBufferSize:    64 * 1024,
+		WriteBufferSize:   64 * 1024,
+		EnableCompression: false,
+		NetDialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, ip, err := s.dialRelayTLS(ctx, addr)
+			usedIP = ip
+			return conn, err
+		},
+	}
+
+	reqHeaders := http.Header{}
+	reqHeaders.Set("User-Agent", "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36")
+
+	select {
+	case s.cfDialSem <- struct{}{}:
+	case <-time.After(5 * time.Second):
+		return nil, "", "", false
+	}
+	wsConn, resp, err := dialer.Dial(wsURL, reqHeaders)
+	time.Sleep(80 * time.Millisecond)
+	<-s.cfDialSem
+
+	statusInfo := ""
+	relayMode := "ws"
+	if resp != nil {
+		statusInfo = fmt.Sprintf(" (HTTP %d)", resp.StatusCode)
+		if m := resp.Header.Get("X-Relay-Mode"); m != "" {
+			relayMode = m
+		}
+		if resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		if resp.StatusCode == 403 || resp.StatusCode == 429 || resp.StatusCode >= 500 {
+			s.workingIPMu.Lock()
+			if s.workingRelayIP == usedIP {
+				s.workingRelayIP = ""
+			}
+			s.workingIPMu.Unlock()
+
+			if resp.StatusCode == 403 && usedIP != "" {
+				markBadRelayIP(usedIP, 5*time.Hour)
+			} else {
+				s.cfBackoffUntil.Store(time.Now().Add(4 * time.Second).UnixNano())
+			}
+		}
+	}
+	if err != nil {
+		if resp == nil && usedIP != "" {
+			s.workingIPMu.Lock()
+			if s.workingRelayIP == usedIP {
+				s.workingRelayIP = ""
+			}
+			s.workingIPMu.Unlock()
+			markBadRelayIP(usedIP, 30*time.Minute)
+		}
+		via := ""
+		if usedIP != "" {
+			via = " via " + usedIP
+		}
+		s.setStatus("Ошибка Cloudflare" + statusInfo)
+		s.addLog("ERR", fmt.Sprintf("#%d CF -> %s%s: %v%s", id, targetLabel, via, err, statusInfo))
+		time.Sleep(1200 * time.Millisecond)
+		return nil, "", "", false
+	}
+	return wsConn, usedIP, relayMode, true
+}
+
+func trimRelayHost(relay string) string {
+	for _, prefix := range []string{"https://", "http://"} {
+		if len(relay) >= len(prefix) && relay[:len(prefix)] == prefix {
+			relay = relay[len(prefix):]
+		}
+	}
+	for i := 0; i < len(relay); i++ {
+		if relay[i] == '/' || relay[i] == '?' {
+			return relay[:i]
+		}
+	}
+	return relay
+}
+
+func (s *Server) runWebSocketBridge(clientConn net.Conn, wsConn *websocket.Conn, initialData []byte, splitter *mtprotoSplitter) (int64, error) {
+	const pongWait = 65 * time.Second
+	const pingPeriod = 30 * time.Second
+
+	s.trackConn(wsConn)
+	defer s.untrackConn(wsConn)
+
+	_ = wsConn.SetReadDeadline(time.Now().Add(pongWait))
+	wsConn.SetPongHandler(func(string) error {
+		_ = wsConn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
+
+	if len(initialData) > 0 {
+		_ = wsConn.SetWriteDeadline(time.Now().Add(8 * time.Second))
+		if err := wsConn.WriteMessage(websocket.BinaryMessage, initialData); err != nil {
+			return 0, err
+		}
+		_ = wsConn.SetWriteDeadline(time.Time{})
+	}
+
+	var writeMu sync.Mutex
+	var closeOnce sync.Once
+	var closing atomic.Bool
+	var rxBytes atomic.Int64
+
+	var wsErrMu sync.Mutex
+	var wsErr error
+	setWSErr := func(err error) {
+		if err == nil {
+			return
+		}
+		wsErrMu.Lock()
+		if wsErr == nil {
+			wsErr = err
+		}
+		wsErrMu.Unlock()
+	}
+
+	done := make(chan struct{})
+	shutdown := func() {
+		closeOnce.Do(func() {
+			closing.Store(true)
+			close(done)
+			_ = wsConn.Close()
+			_ = clientConn.Close()
+		})
+	}
+
+	go func() {
+		ticker := time.NewTicker(pingPeriod)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				writeMu.Lock()
+				_ = wsConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+				err := wsConn.WriteMessage(websocket.PingMessage, nil)
+				_ = wsConn.SetWriteDeadline(time.Time{})
+				writeMu.Unlock()
+				if err != nil {
+					if !closing.Load() {
+						setWSErr(err)
+					}
+					shutdown()
+					return
+				}
+			}
+		}
+	}()
+
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		defer shutdown()
+		for {
+			msgType, data, err := wsConn.ReadMessage()
+			if err != nil {
+				if !closing.Load() {
+					setWSErr(err)
+				}
+				return
+			}
+			_ = wsConn.SetReadDeadline(time.Now().Add(pongWait))
+			if msgType != websocket.BinaryMessage {
+				continue
+			}
+			rxBytes.Add(int64(len(data)))
+			if _, err := clientConn.Write(data); err != nil {
+				return
+			}
+		}
+	}()
+
+	buf := make([]byte, 64*1024)
 	for {
 		n, err := clientConn.Read(buf)
 		if n > 0 {
@@ -243,8 +731,15 @@ func (s *Server) runWebSocketBridge(clientConn net.Conn, wsConn *websocket.Conn,
 				_ = wsConn.SetWriteDeadline(time.Time{})
 				writeMu.Unlock()
 				if wErr != nil {
+					if !closing.Load() {
+						setWSErr(wErr)
+					}
 					shutdown()
-					return
+					<-readDone
+					wsErrMu.Lock()
+					outErr := wsErr
+					wsErrMu.Unlock()
+					return rxBytes.Load(), outErr
 				}
 			}
 		}
@@ -252,7 +747,13 @@ func (s *Server) runWebSocketBridge(clientConn net.Conn, wsConn *websocket.Conn,
 			break
 		}
 	}
+
 	shutdown()
+	<-readDone
+	wsErrMu.Lock()
+	outErr := wsErr
+	wsErrMu.Unlock()
+	return rxBytes.Load(), outErr
 }
 
 func (s *Server) dialRelayTLS(ctx context.Context, addr string) (net.Conn, string, error) {
@@ -265,9 +766,8 @@ func (s *Server) dialRelayTLS(ctx context.Context, addr string) (net.Conn, strin
 	cachedRelay := s.workingRelayIP
 	s.workingIPMu.RUnlock()
 
-	if cachedRelay != "" {
+	if cachedRelay != "" && !isBadRelayIP(cachedRelay) {
 		fastCtx, cancel := context.WithTimeout(ctx, 1800*time.Millisecond)
-		// Для Cloudflare Worker всегда проверяем TLS-сертификат (insecure = false)
 		conn, err := s.dialSingleTLS(fastCtx, cachedRelay, port, host, false)
 		cancel()
 		if err == nil {
@@ -280,25 +780,36 @@ func (s *Server) dialRelayTLS(ctx context.Context, addr string) (net.Conn, strin
 		s.workingIPMu.Unlock()
 	}
 
-	seen := make(map[string]bool)
-	var candidates []string
-	add := func(ip string) {
-		if ip != "" && ip != cachedRelay && !seen[ip] {
-			seen[ip] = true
-			candidates = append(candidates, ip)
-		}
-	}
-
 	dnsCtx, cancelDNS := context.WithTimeout(ctx, 1500*time.Millisecond)
-	for _, ip := range s.doh.ResolveAllIPv4(dnsCtx, host) {
-		add(ip)
-	}
+	dnsIPs := s.doh.ResolveAllIPv4(dnsCtx, host)
 	cancelDNS()
 
-	for _, fb := range cfFallbackIPs {
-		add(fb)
+	buildList := func(skipBad bool) []string {
+		seen := make(map[string]bool)
+		var out []string
+		add := func(ip string) {
+			if ip == "" || ip == cachedRelay || seen[ip] {
+				return
+			}
+			if skipBad && isBadRelayIP(ip) {
+				return
+			}
+			seen[ip] = true
+			out = append(out, ip)
+		}
+		for _, ip := range dnsIPs {
+			add(ip)
+		}
+		for _, fb := range cfFallbackIPs {
+			add(fb)
+		}
+		return out
 	}
 
+	candidates := buildList(true)
+	if len(candidates) == 0 {
+		candidates = buildList(false)
+	}
 	if len(candidates) == 0 {
 		return nil, "", errors.New("нет доступных узлов Cloudflare")
 	}

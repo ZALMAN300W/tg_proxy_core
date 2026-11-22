@@ -11,21 +11,25 @@ import (
 	"time"
 )
 
-const directCooldownDuration = 60 * time.Second
+const directCooldownDuration = 10 * time.Minute
 
 type Server struct {
-	listenAddr  string
-	listener    net.Listener
-	doh         *dohResolver
-	mu          sync.RWMutex
-	running     bool
-	lastStatus  string
-	connCount   atomic.Int64
-	fragEnabled atomic.Bool
-	relayHost   string
-	relayKey    string
+	listenAddr       string
+	listener         net.Listener
+	doh              *dohResolver
+	mu               sync.RWMutex
+	running          bool
+	lastStatus       string
+	connCount        atomic.Int64
+	fragEnabled      atomic.Bool
+	relayHost        string
+	relayKey         string
+	mtprotoSecret    []byte
+	mtprotoSecretHex string
 
 	directBlockedUntil atomic.Int64
+	cfBackoffUntil     atomic.Int64
+	cfDialSem          chan struct{}
 
 	workingIPMu    sync.RWMutex
 	workingIPs     map[int]string
@@ -38,14 +42,37 @@ type Server struct {
 }
 
 func NewServer(listenAddr string) *Server {
+	secretRaw, secretHex, _ := decodeMTProtoSecret(defaultMTProtoSecretHex)
 	s := &Server{
-		listenAddr: listenAddr,
-		doh:        newDoHResolver(),
-		lastStatus: "Остановлен",
-		workingIPs: make(map[int]string),
+		listenAddr:       listenAddr,
+		doh:              newDoHResolver(),
+		lastStatus:       "Остановлен",
+		workingIPs:       make(map[int]string),
+		cfDialSem:        make(chan struct{}, 3),
+		mtprotoSecret:    secretRaw,
+		mtprotoSecretHex: secretHex,
 	}
 	s.fragEnabled.Store(true)
 	return s
+}
+
+func (s *Server) SetMTProtoSecret(hexSecret string) {
+	raw, cleanHex, err := decodeMTProtoSecret(hexSecret)
+	if err != nil {
+		s.addLog("ERR", "Секрет MTProto: "+err.Error())
+		return
+	}
+	s.mu.Lock()
+	s.mtprotoSecret = raw
+	s.mtprotoSecretHex = cleanHex
+	s.mu.Unlock()
+	s.addLog("CFG", "Секрет MTProto обновлён: dd"+cleanHex)
+}
+
+func (s *Server) GetMTProtoSecret() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return "dd" + s.mtprotoSecretHex
 }
 
 func (s *Server) addLog(tag, msg string) {
@@ -83,6 +110,7 @@ func (s *Server) SetDoHMode(mode string) {
 	s.workingRelayIP = ""
 	s.workingIPMu.Unlock()
 	s.directBlockedUntil.Store(0)
+	s.cfBackoffUntil.Store(0)
 	s.addLog("CFG", "Режим DNS: "+mode)
 }
 
@@ -104,6 +132,7 @@ func (s *Server) SetRelayHost(host string) {
 	s.workingRelayIP = ""
 	s.workingIPMu.Unlock()
 	s.directBlockedUntil.Store(0)
+	s.cfBackoffUntil.Store(0)
 	if host != "" {
 		s.addLog("CFG", "Резервный Cloudflare: "+host+" (сначала напрямую)")
 	}
@@ -118,15 +147,15 @@ func (s *Server) SetRelayKey(key string) {
 	}
 }
 
-// OnNetworkChanged вызывается из Android при смене Wi-Fi <-> 4G:
-// сбрасывает DNS/IP-кэши, паузу Cloudflare и закрывает зависшие старые сокеты.
 func (s *Server) OnNetworkChanged() {
 	s.doh.ClearCache()
 	s.workingIPMu.Lock()
 	s.workingIPs = make(map[int]string)
 	s.workingRelayIP = ""
 	s.workingIPMu.Unlock()
+	clearBadRelayIPs()
 	s.directBlockedUntil.Store(0)
+	s.cfBackoffUntil.Store(0)
 
 	closed := s.closeAllActiveConns()
 	s.addLog("NET", fmt.Sprintf("Смена сети — сброс маршрутов (закрыто сокетов: %d)", closed))
@@ -187,10 +216,13 @@ func (s *Server) Start() error {
 	s.listener = ln
 	s.running = true
 	s.directBlockedUntil.Store(0)
+	s.cfBackoffUntil.Store(0)
+	secretHex := s.mtprotoSecretHex
 	s.mu.Unlock()
 
 	s.setStatus("Активен (" + s.listenAddr + ")")
 	s.addLog("SYS", "Прокси запущен на "+s.listenAddr)
+	s.addLog("SYS", "MTProto secret: dd"+secretHex)
 
 	for {
 		conn, err := ln.Accept()
@@ -239,6 +271,6 @@ func (s *Server) markDirectUnavailable() {
 	until := now.Add(directCooldownDuration).UnixNano()
 	s.directBlockedUntil.Store(until)
 	if now.UnixNano() >= prev {
-		s.addLog("AUTO", "Прямой канал нестабилен — переход на Cloudflare на 60 сек")
+		s.addLog("AUTO", "Прямой канал нестабилен — переход на Cloudflare на 10 мин")
 	}
 }
